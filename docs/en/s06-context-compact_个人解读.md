@@ -243,3 +243,97 @@ if query.strip() == "/compact":
 ```
 
 直接 bypass LLM，在 harness 层保证执行。当前代码依赖 LLM 行为属于**隐式约定**，不是硬保证。
+
+## 问题: auto_compact我看会保留compact前的messages, 这个保存了之后, 有后续使用吗?
+
+**没有**，保存的 transcript 在代码里没有任何后续读取逻辑。
+
+```python
+def auto_compact(messages: list) -> list:
+    # 保存到磁盘
+    transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
+    with open(transcript_path, "w") as f:
+        for msg in messages:
+            f.write(json.dumps(msg, default=str) + "\n")
+    print(f"[transcript saved: {transcript_path}]")
+    # ... 做摘要，返回新 messages
+```
+
+整个代码库里没有任何地方读取 `.transcripts/` 目录下的文件。
+
+### 那它存在的意义是什么？
+
+纯粹是**人工兜底**，面向的是开发者而非程序本身：
+
+1. **事后审计**：压缩是有损的，如果 agent 后来表现异常，可以回翻原始对话找原因
+2. **调试**：查看 LLM 做了哪些工具调用、输出了什么
+3. **心理安全感**：数据没有真正丢失，只是移出了活跃上下文
+
+如果要让它真正有用，需要额外实现"从 transcript 恢复"的逻辑，比如：
+
+```python
+# 目前不存在的功能
+if user_says("/restore"):
+    latest = sorted(TRANSCRIPT_DIR.glob("*.jsonl"))[-1]
+    history[:] = load_transcript(latest)
+```
+
+所以现在的 transcript 存储是**单向写入，只供人看**，不是程序自动恢复机制。
+
+## 问题: micro_compact是否会影响LLM的缓存? 因为context变了
+
+**会影响，且超过阈值后每轮都有一次局部 cache miss。** 修正后的完整分析：
+
+### 阶段一：tool_result 总数 ≤ 3
+
+micro_compact 直接返回，messages 不变，**完全不影响缓存**。
+
+### 阶段二：tool_result 总数 > 3（稳态）
+
+每轮必然有一条结果**首次被压缩**：
+
+```
+Turn 4: r3 首次变为 "[Previous: used bash]"  → cache miss（从 r3 位置往后失效）
+Turn 5: r4 首次被压缩                         → cache miss
+Turn 6: r5 首次被压缩                         → cache miss
+...
+```
+
+也就是说，**超过阈值后每轮固定一次 cache miss**，不是偶发的。
+
+### 已压缩结果的行为
+
+一旦某条结果被压缩为占位符（≤100字符），后续轮次对它来说内容不再变化，该位置**重新命中缓存**。但它之后的新内容每轮仍在扩展，cache miss 的位置只是随着对话向后滚动。
+
+### read_file 的特殊性
+
+`read_file` 结果永远不被压缩，内容稳定，**持续命中缓存**——但代价是它一直占用 token，加速触发 auto_compact。
+
+### 总结
+
+| 情况 | 缓存影响 |
+|---|---|
+| 总数 ≤ 3 | 无影响 |
+| 总数 > 3 | 每轮一次局部 cache miss（滚动向后） |
+| auto_compact 触发 | 全量 cache miss，从头重建 |
+
+## 问题: micro_compact这个只是局部的cache miss, 其实整体命中的缓存还是很多的, 可以这么理解吧?
+
+基本正确，但要加一个前提条件。
+
+### 为什么整体命中率高
+
+Anthropic 的 cache 是**前缀匹配**的。micro_compact 每轮只修改倒数第 4 条 tool_result（`KEEP_RECENT=3`，压缩的是第 `n-3` 条）：
+
+```
+[r0✓ r1✓ r2✓ ... r(n-4)✓ | r(n-3) ← 本轮首次压缩 | r(n-2) r(n-1) r(n)]
+ ←————— 全部命中缓存 —————→  cache miss 从这里开始
+```
+
+随着对话增长，稳定前缀越来越长，cache miss 的位置始终在"尾部附近"，**大头都能命中**。
+
+### 前提条件
+
+这个结论成立的前提是 `read_file` 结果没有大量堆积。如果 agent 读了很多文件，这些结果永远不被压缩，稳定前缀里夹杂着大量 `read_file` 内容，虽然缓存能命中，但 token 消耗居高不下，auto_compact 会很快被触发——届然整个 cache 清零，前面积累的命中率优势全部归零。
+
+所以：**在 `bash` 为主的任务里，你的理解正确；在 `read_file` 密集的任务里，micro_compact 的缓存优势很快会被 auto_compact 截断。**
